@@ -81,6 +81,13 @@ int main(int argc, char **argv) {
                 fs.https = true;
             }
             break;
+            
+            // IPv6 support
+            case '6':
+            {
+                fs.use_ipv6 = true;
+            }
+            break;
 
             // output directory path
             case 'o':
@@ -127,10 +134,10 @@ int main(int argc, char **argv) {
             // Display help in case of any unsupported argument
             default:
             {
-                printf("usage: fiche [-dLpsSoBulbw].\n");
+                printf("usage: fiche [-dLpsSo6Bulbw].\n");
                 printf("             [-d domain] [-L listen_addr] [-p port] [-s slug size]\n");
                 printf("             [-o output directory] [-B buffer size] [-u user name]\n");
-                printf("             [-l log file] [-b banlist] [-w whitelist] [-S]\n");
+                printf("             [-l log file] [-b banlist] [-w whitelist] [-S] [-6]\n");
                 return 0;
             }
             break;

@@ -64,6 +64,11 @@ typedef struct Fiche_Settings {
     bool https;
 
     /**
+     * @brief If set, server will use IPv6
+     */
+    bool use_ipv6;
+
+    /**
      * @brief Connection buffer length
      *
      * @remarks Length of this buffer limits max size of uploaded files

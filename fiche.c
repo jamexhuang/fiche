@@ -15,6 +15,7 @@ usage: fiche [-DepbsdolBuw].
              [-l log file] [-b banlist] [-w whitelist]
 -D option is for daemonizing fiche
 -e option is for using an extended character set for the URL
+-6 option is for enabling IPv6 support
 
 Compile with Makefile or manually with -O2 and -pthread flags.
 
@@ -61,8 +62,8 @@ const char *Fiche_Symbols = "abcdefghijklmnopqrstuvwxyz0123456789";
 
 struct fiche_connection {
     int socket;
-    struct sockaddr_in address;
-
+    struct sockaddr_storage address;
+    socklen_t addr_len;
     Fiche_Settings *settings;
 };
 
@@ -179,6 +180,13 @@ static void get_date(char *buf);
 
 
 /**
+ * @brief Gets IP address string from sockaddr_storage
+ * @returns 0 on success, -1 on error
+ */
+static int get_ip_str(const struct sockaddr_storage *sa, char *s, size_t maxlen);
+
+
+/**
  * @brief Time seed
  */
 unsigned int seed;
@@ -197,13 +205,15 @@ void fiche_init(Fiche_Settings *settings) {
         "example.com",
         // output dir
         "code",
-	// listen_addr
-	"0.0.0.0",
+        // listen_addr
+        "0.0.0.0",
         // port
         9999,
         // slug length
         4,
         // https
+        false,
+        // use_ipv6
         false,
         // buffer length
         32768,
@@ -428,39 +438,74 @@ static int perform_user_change(const Fiche_Settings *settings) {
 
 static int start_server(Fiche_Settings *settings) {
 
+    int s;
+    int domain = settings->use_ipv6 ? AF_INET6 : AF_INET;
+    
     // Perform socket creation
-    int s = socket(AF_INET, SOCK_STREAM, 0);
+    s = socket(domain, SOCK_STREAM, 0);
     if (s < 0) {
         print_error("Couldn't create a socket!");
         return -1;
     }
 
     // Set socket settings
-    if ( setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 } , sizeof(int)) != 0 ) {
+    if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int)) != 0) {
         print_error("Couldn't prepare the socket!");
         return -1;
     }
 
-    // Prepare address and port handler
-    struct sockaddr_in address;
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = inet_addr(settings->listen_addr);
-    address.sin_port = htons(settings->port);
-
-    // Bind to port
-    if ( bind(s, (struct sockaddr *) &address, sizeof(address)) != 0) {
-        print_error("Couldn't bind to the port: %d!", settings->port);
-        return -1;
+    if (settings->use_ipv6) {
+        // Disable IPv6-only mode to allow dual-stack (IPv4 and IPv6)
+        if (setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &(int){ 0 }, sizeof(int)) != 0) {
+            print_error("Couldn't set IPV6_V6ONLY option!");
+        }
+        
+        // Prepare address and port handler for IPv6
+        struct sockaddr_in6 address;
+        memset(&address, 0, sizeof(address));
+        address.sin6_family = AF_INET6;
+        address.sin6_port = htons(settings->port);
+        
+        // Convert listen address
+        if (inet_pton(AF_INET6, settings->listen_addr, &address.sin6_addr) != 1) {
+            // If not a valid IPv6 address, try to use any address
+            if (strcmp(settings->listen_addr, "0.0.0.0") == 0) {
+                address.sin6_addr = in6addr_any;
+            } else {
+                print_error("Invalid IPv6 address specified: %s", settings->listen_addr);
+                return -1;
+            }
+        }
+        
+        // Bind to port
+        if (bind(s, (struct sockaddr *)&address, sizeof(address)) != 0) {
+            print_error("Couldn't bind to the port: %d!", settings->port);
+            return -1;
+        }
+    } else {
+        // Prepare address and port handler for IPv4
+        struct sockaddr_in address;
+        memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_port = htons(settings->port);
+        address.sin_addr.s_addr = inet_addr(settings->listen_addr);
+        
+        // Bind to port
+        if (bind(s, (struct sockaddr *)&address, sizeof(address)) != 0) {
+            print_error("Couldn't bind to the port: %d!", settings->port);
+            return -1;
+        }
     }
 
     // Start listening
-    if ( listen(s, 128) != 0 ) {
+    if (listen(s, 128) != 0) {
         print_error("Couldn't start listening on the socket!");
         return -1;
     }
 
-    print_status("Server started listening on: %s:%d.",
-		    settings->listen_addr, settings->port);
+    print_status("Server started listening on %s:%d (IPv%s).",
+            settings->listen_addr, settings->port,
+            settings->use_ipv6 ? "6" : "4");
     print_separator();
 
     // Run dispatching loop
@@ -487,11 +532,11 @@ static int start_server(Fiche_Settings *settings) {
 static void dispatch_connection(int socket, Fiche_Settings *settings) {
 
     // Create address structs for this socket
-    struct sockaddr_in address;
+    struct sockaddr_storage address;
     socklen_t addlen = sizeof(address);
 
     // Accept a connection and get a new socket id
-    const int s = accept(socket, (struct sockaddr *) &address, &addlen);
+    const int s = accept(socket, (struct sockaddr *)&address, &addlen);
     if (s < 0 ) {
         print_error("Error on accepting connection!");
         return;
@@ -516,6 +561,7 @@ static void dispatch_connection(int socket, Fiche_Settings *settings) {
     }
     c->socket = s;
     c->address = address;
+    c->addr_len = addlen;
     c->settings = settings;
 
     // Spawn a new thread to handle this connection
@@ -538,13 +584,16 @@ static void *handle_connection(void *args) {
     // Cast args to it's previous type
     struct fiche_connection *c = (struct fiche_connection *) args;
 
-    // Get client's IP
-    const char *ip = inet_ntoa(c->address.sin_addr);
+    // Get client's IP (support both IPv4 and IPv6)
+    char ip[INET6_ADDRSTRLEN];
+    if (get_ip_str(&c->address, ip, sizeof(ip)) != 0) {
+        strcpy(ip, "unknown");
+    }
 
     // Get client's hostname
     char hostname[1024];
 
-    if (getnameinfo((struct sockaddr *)&c->address, sizeof(c->address),
+    if (getnameinfo((struct sockaddr *)&c->address, c->addr_len,
             hostname, sizeof(hostname), NULL, 0, 0) != 0 ) {
 
         // Couldn't resolve a hostname
@@ -669,7 +718,6 @@ static void *handle_connection(void *args) {
     print_separator();
 
     // Log connection
-    // TODO: log unsuccessful and rejected connections
     log_entry(c->settings, ip, hostname, slug);
 
     // Close the connection
@@ -775,5 +823,20 @@ static int save_to_file(const Fiche_Settings *s, uint8_t *data, char *slug) {
     fclose(f);
     free(path);
 
+    return 0;
+}
+
+static int get_ip_str(const struct sockaddr_storage *sa, char *s, size_t maxlen) {
+    switch(sa->ss_family) {
+        case AF_INET:
+            inet_ntop(AF_INET, &(((struct sockaddr_in *)sa)->sin_addr), s, maxlen);
+            break;
+        case AF_INET6:
+            inet_ntop(AF_INET6, &(((struct sockaddr_in6 *)sa)->sin6_addr), s, maxlen);
+            break;
+        default:
+            strncpy(s, "Unknown AF", maxlen);
+            return -1;
+    }
     return 0;
 }
